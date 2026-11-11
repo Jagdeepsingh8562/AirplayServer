@@ -9,6 +9,12 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#ifndef WIN32
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#endif
 
 #include "raop.h"
 #include "netutils.h"
@@ -201,6 +207,77 @@ raop_rtp_mirror_thread_time(void *arg)
 }
 //#define DUMP_H264
 
+/* No frame is bigger than this; a larger size means the stream is out of step. */
+#define MIRROR_MAX_PAYLOAD (8 * 1024 * 1024)
+
+/* Reads exactly len bytes. Returns 0, or -1 when the phone closed the connection, the read failed or the session
+ * is being stopped. The old loops did `got += recv()` without looking at the result, so a connection that closed
+ * in the middle of a frame (recv() == 0) spun at full speed for ever, and stopping the session then waited for
+ * that thread, so the whole receiver hung. */
+static int
+mirror_recv_all(raop_rtp_mirror_t *mirror, int fd, unsigned char *buf, int len)
+{
+    int got = 0;
+    while (got < len) {
+        int r = recv(fd, (char *)buf + got, len - got, 0);
+        if (r > 0) {
+            got += r;
+            continue;
+        }
+        if (r == 0) {
+            return -1;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* the receive timeout: keep waiting, unless the session is being stopped */
+            int running;
+            MUTEX_LOCK(mirror->run_mutex);
+            running = mirror->running;
+            MUTEX_UNLOCK(mirror->run_mutex);
+            if (!running) {
+                return -1;
+            }
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+/* Reads and throws away len bytes. */
+static int
+mirror_discard(raop_rtp_mirror_t *mirror, int fd, int len)
+{
+    unsigned char scratch[1024];
+    while (len > 0) {
+        int n = len < (int)sizeof(scratch) ? len : (int)sizeof(scratch);
+        if (mirror_recv_all(mirror, fd, scratch, n) < 0) {
+            return -1;
+        }
+        len -= n;
+    }
+    return 0;
+}
+
+/* Probe an idle connection (a phone that vanished) and never block for ever on a half-sent frame. */
+static void
+mirror_set_socket_options(int fd)
+{
+#ifndef WIN32
+    int on = 1, idle = 5, interval = 3, count = 3;
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&on, sizeof(on));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, (const char *)&idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, (const char *)&interval, sizeof(interval));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, (const char *)&count, sizeof(count));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+#endif
+}
+
 #define RAOP_PACKET_LEN 32768
 /**
  * 镜像
@@ -253,8 +330,10 @@ raop_rtp_mirror_thread(void *arg)
             /* Timeout happened */
             continue;
         } else if (ret == -1) {
-            /* FIXME: Error happened */
-            logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in select");
+            if (errno == EINTR) {
+                continue; /* a signal interrupted the wait: ending the stream here dropped a healthy session */
+            }
+            logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in select (video): %s", strerror(errno));
             break;
         }
         if (stream_fd == -1 && FD_ISSET(raop_rtp_mirror->mirror_data_sock, &rfds)) {
@@ -269,6 +348,7 @@ raop_rtp_mirror_thread(void *arg)
                 logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in accept %d %s", errno, strerror(errno));
                 break;
             }
+            mirror_set_socket_options(stream_fd);
         }
         if (stream_fd != -1 && FD_ISSET(stream_fd, &rfds)) {
             // packetlen初始0
@@ -278,8 +358,10 @@ raop_rtp_mirror_thread(void *arg)
                 logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed");
                 break;
             } else if (ret == -1) {
-                /* FIXME: Error happened */
-                logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in recv");
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Error in recv: %s", strerror(errno));
                 break;
             }
             readstart += ret;
@@ -291,15 +373,17 @@ raop_rtp_mirror_thread(void *arg)
                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "handle http data");
             } else {
                 // 普通数据块
-                do {
-                    // 读取剩下的124字节
-                    ret = recv(stream_fd, packet + readstart, 128 - readstart, 0);
-                    readstart = readstart + ret;
-                } while (readstart < 128);
+                /* the other 124 bytes of the 128-byte header */
+                if (mirror_recv_all(raop_rtp_mirror, stream_fd, packet + readstart, 128 - readstart) < 0) {
+                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed inside a packet header");
+                    goto stream_ended;
+                }
                 int payloadsize = byteutils_get_int(packet, 0);
-                // FIXME: 这里计算方式需要再确认
                 short payloadtype = (short) (byteutils_get_short(packet, 4) & 0xff);
-                short payloadoption = byteutils_get_short(packet, 6);
+                if (payloadsize < 0 || payloadsize > MIRROR_MAX_PAYLOAD) {
+                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Bad packet size %d: ending the stream", payloadsize);
+                    goto stream_ended;
+                }
 
                 // 处理内容数据
                 if (payloadtype == 0) {
@@ -311,143 +395,94 @@ raop_rtp_mirror_thread(void *arg)
                         pts =  ntptopts(payloadntp) - pts_base;
                     }
                     // 这里是加密的数据
-                    unsigned char* payload_in = malloc(payloadsize);
-                    unsigned char* payload = malloc(payloadsize);
-                    readstart = 0;
-                    do {
-                        // payload数据
-                        ret = recv(stream_fd, payload_in + readstart, payloadsize - readstart, 0);
-                        readstart = readstart + ret;
-                    } while (readstart < payloadsize);
-                    //logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "readstart = %d", readstart);
-#ifdef DUMP_H264
-                    fwrite(payload_in, payloadsize, 1, file_source);
-                    fwrite(&readstart, sizeof(readstart), 1, file_len);
-#endif
+                    unsigned char* payload_in = malloc(payloadsize + 1);
+                    unsigned char* payload = malloc(payloadsize + 1);
+                    if (!payload_in || !payload || mirror_recv_all(raop_rtp_mirror, stream_fd, payload_in, payloadsize) < 0) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed inside a frame");
+                        free(payload_in);
+                        free(payload);
+                        goto stream_ended;
+                    }
                     // 解密数据
                     mirror_buffer_decrypt(raop_rtp_mirror->buffer, payload_in, payload, payloadsize);
+                    /* Each unit starts with its length, which becomes a start code. A bad length (the key out of
+                     * step after a restarted session) used to loop for ever or write past the buffer. */
                     int nalu_size = 0;
-                    int nalu_num = 0;
+                    int frame_ok = 1;
                     while (nalu_size < payloadsize) {
-                        int nc_len = (payload[nalu_size + 0] << 24) | (payload[nalu_size + 1] << 16) | (payload[nalu_size + 2] << 8) | (payload[nalu_size + 3]);
-                        if (nc_len > 0) {
-                            payload[nalu_size + 0] = 0;
-                            payload[nalu_size + 1] = 0;
-                            payload[nalu_size + 2] = 0;
-                            payload[nalu_size + 3] = 1;
-                            //int nalutype = payload[4] & 0x1f;
-                            //logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "nalutype = %d", nalutype);
-                            nalu_size += nc_len + 4;
-                            nalu_num++;
+                        if (nalu_size + 4 > payloadsize) {
+                            frame_ok = 0;
+                            break;
                         }
+                        int nc_len = (payload[nalu_size + 0] << 24) | (payload[nalu_size + 1] << 16) | (payload[nalu_size + 2] << 8) | (payload[nalu_size + 3]);
+                        if (nc_len <= 0 || nc_len > payloadsize - nalu_size - 4) {
+                            frame_ok = 0;
+                            break;
+                        }
+                        payload[nalu_size + 0] = 0;
+                        payload[nalu_size + 1] = 0;
+                        payload[nalu_size + 2] = 0;
+                        payload[nalu_size + 3] = 1;
+                        nalu_size += nc_len + 4;
                     }
-                    //logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "nalu_size = %d, payloadsize = %d nalu_num = %d", nalu_size, payloadsize, nalu_num);
-
-                    // 写入文件
-#ifdef DUMP_H264
-                    fwrite(payload, payloadsize, 1, file);
-#endif
-                    h264_decode_struct h264_data;
-                    h264_data.data_len = payloadsize;
-                    h264_data.data = payload;
-                    h264_data.frame_type = 1;
-                    h264_data.pts = pts;
-                    raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, &h264_data);
+                    if (frame_ok && payloadsize > 0) {
+                        h264_decode_struct h264_data;
+                        h264_data.data_len = payloadsize;
+                        h264_data.data = payload;
+                        h264_data.frame_type = 1;
+                        h264_data.pts = pts;
+                        raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, &h264_data);
+                    } else {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Dropped a frame with a bad length");
+                    }
                     free(payload_in);
                     free(payload);
                 } else if ((payloadtype & 255) == 1) {
-                    float mWidthSource = byteutils_get_float(packet, 40);
-                    float mHeightSource = byteutils_get_float(packet, 44);
-                    float mWidth = byteutils_get_float(packet, 56);
-                    float mHeight =byteutils_get_float(packet, 60);
-                    logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "mWidthSource = %f mHeightSource = %f mWidth = %f mHeight = %f", mWidthSource, mHeightSource, mWidth, mHeight);
-                    /*int mRotateMode = 0;
-
-                    int p = payloadtype >> 8;
-                    if (p == 4) {
-                        mRotateMode = 1;
-                    } else if (p == 7) {
-                        mRotateMode = 3;
-                    } else if (p != 0) {
-                        mRotateMode = 2;
-                    }*/
-
                     // sps_pps 这块数据是没有加密的
-                    unsigned char payload[payloadsize];
-                    readstart = 0;
-                    do {
-                        // payload数据
-                        ret = recv(stream_fd, payload + readstart, payloadsize - readstart, 0);
-                        readstart = readstart + ret;
-                    } while (readstart < payloadsize);
-                    h264codec_t h264;
-                    h264.version = payload[0];
-                    h264.profile_high = payload[1];
-                    h264.compatibility = payload[2];
-                    h264.level = payload[3];
-                    h264.reserved6andNAL = payload[4];
-                    h264.reserved3andSPS = payload[5];
-                    h264.lengthofSPS = (short) (((payload[6] & 255) << 8) + (payload[7] & 255));
-                    logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "lengthofSPS = %d", h264.lengthofSPS);
-                    h264.sequence = malloc(h264.lengthofSPS);
-                    memcpy(h264.sequence, payload + 8, h264.lengthofSPS);
-                    h264.numberOfPPS = payload[h264.lengthofSPS + 8];
-                    h264.lengthofPPS = (short) (((payload[h264.lengthofSPS + 9] & 2040) + payload[h264.lengthofSPS + 10]) & 255);
-                    h264.picture_parameter_set = malloc(h264.lengthofPPS);
-                    logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "lengthofPPS = %d", h264.lengthofPPS);
-                    memcpy(h264.picture_parameter_set, payload + h264.lengthofSPS + 11, h264.lengthofPPS);
-                    if (h264.lengthofSPS + h264.lengthofPPS < 102400) {
+                    unsigned char* payload = malloc(payloadsize + 1);
+                    if (!payload || mirror_recv_all(raop_rtp_mirror, stream_fd, payload, payloadsize) < 0) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed inside the codec packet");
+                        free(payload);
+                        goto stream_ended;
+                    }
+                    /* avcC: 6 bytes, the SPS length and SPS, the PPS count, the PPS length and PPS */
+                    int sps_len = payloadsize >= 8 ? (((payload[6] & 255) << 8) + (payload[7] & 255)) : -1;
+                    int pps_len = -1;
+                    if (sps_len >= 0 && sps_len + 11 <= payloadsize) {
+                        pps_len = (((payload[sps_len + 9] & 2040) + payload[sps_len + 10]) & 255);
+                    }
+                    if (pps_len >= 0 && sps_len + 11 + pps_len <= payloadsize && sps_len + pps_len < 102400) {
                         // 复制spspps
-                        int sps_pps_len = (h264.lengthofSPS + h264.lengthofPPS) + 8;
-                        unsigned char sps_pps[sps_pps_len];
-                        sps_pps[0] = 0;
-                        sps_pps[1] = 0;
-                        sps_pps[2] = 0;
-                        sps_pps[3] = 1;
-                        memcpy(sps_pps + 4, h264.sequence, h264.lengthofSPS);
-                        sps_pps[h264.lengthofSPS + 4] = 0;
-                        sps_pps[h264.lengthofSPS + 5] = 0;
-                        sps_pps[h264.lengthofSPS + 6] = 0;
-                        sps_pps[h264.lengthofSPS + 7] = 1;
-                        memcpy(sps_pps + h264.lengthofSPS + 8, h264.picture_parameter_set, h264.lengthofPPS);
-#ifdef DUMP_H264
-                        fwrite(sps_pps, sps_pps_len, 1, file);
-#endif
-                        h264_decode_struct h264_data;
-                        h264_data.data_len = sps_pps_len;
-                        h264_data.data = sps_pps;
-                        h264_data.frame_type = 0;
-                        h264_data.pts = 0;
-                        raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, &h264_data);
+                        int sps_pps_len = sps_len + pps_len + 8;
+                        unsigned char* sps_pps = malloc(sps_pps_len);
+                        if (sps_pps) {
+                            sps_pps[0] = 0;
+                            sps_pps[1] = 0;
+                            sps_pps[2] = 0;
+                            sps_pps[3] = 1;
+                            memcpy(sps_pps + 4, payload + 8, sps_len);
+                            sps_pps[sps_len + 4] = 0;
+                            sps_pps[sps_len + 5] = 0;
+                            sps_pps[sps_len + 6] = 0;
+                            sps_pps[sps_len + 7] = 1;
+                            memcpy(sps_pps + sps_len + 8, payload + sps_len + 11, pps_len);
+                            h264_decode_struct h264_data;
+                            h264_data.data_len = sps_pps_len;
+                            h264_data.data = sps_pps;
+                            h264_data.frame_type = 0;
+                            h264_data.pts = 0;
+                            raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, &h264_data);
+                            free(sps_pps);
+                        }
+                    } else {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Ignored a codec packet with bad lengths");
                     }
-                    free(h264.picture_parameter_set);
-                    free(h264.sequence);
-                } else if (payloadtype == (short) 2) {
-                    readstart = 0;
-                    if (payloadsize > 0) {
-                        unsigned char* payload_in = malloc(payloadsize);
-                        do {
-                            ret = recv(stream_fd, payload_in + readstart, payloadsize - readstart, 0);
-                            readstart = readstart + ret;
-                        } while (readstart < payloadsize);
-                    }
-                } else if (payloadtype == (short) 4) {
-                    readstart = 0;
-                    if (payloadsize > 0) {
-                        unsigned char* payload_in = malloc(payloadsize);
-                        do {
-                            ret = recv(stream_fd, payload_in + readstart, payloadsize - readstart, 0);
-                            readstart = readstart + ret;
-                        } while (readstart < payloadsize);
-                    }
+                    free(payload);
                 } else {
-                    readstart = 0;
-                    if (payloadsize > 0) {
-                        unsigned char* payload_in = malloc(payloadsize);
-                        do {
-                            ret = recv(stream_fd, payload_in + readstart, payloadsize - readstart, 0);
-                            readstart = readstart + ret;
-                        } while (readstart < payloadsize);
+                    /* heartbeats and packets of kinds we do not use: read them and drop them (they used to leak) */
+                    if (payloadsize > 0 && mirror_discard(raop_rtp_mirror, stream_fd, payloadsize) < 0) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "TCP socket closed inside a packet");
+                        goto stream_ended;
                     }
                 }
             }
@@ -456,9 +491,14 @@ raop_rtp_mirror_thread(void *arg)
         }
     }
 
+stream_ended:
     /* Close the stream file descriptor */
     if (stream_fd != -1) {
         closesocket(stream_fd);
+    }
+    /* The picture will not change any more: let the player go back to its idle screen. */
+    if (raop_rtp_mirror->callbacks.video_end) {
+        raop_rtp_mirror->callbacks.video_end(raop_rtp_mirror->callbacks.cls);
     }
     logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "Exiting TCP raop_rtp_mirror_thread thread");
 #ifdef DUMP_H264

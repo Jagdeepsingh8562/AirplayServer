@@ -68,6 +68,23 @@ struct raop_conn_s {
 };
 typedef struct raop_conn_s raop_conn_t;
 
+/* Only one mirroring session is shown. The connection that last set one up owns it; when a phone connects again
+ * while an older connection is still open (it died without closing), the older one's streams are stopped. */
+static raop_conn_t *g_active_conn = NULL;
+
+static void
+conn_stop_streams(raop_conn_t *conn)
+{
+	if (conn->raop_rtp) {
+		raop_rtp_destroy(conn->raop_rtp);
+		conn->raop_rtp = NULL;
+	}
+	if (conn->raop_rtp_mirror) {
+		raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
+		conn->raop_rtp_mirror = NULL;
+	}
+}
+
 #include "raop_handlers.h"
 
 static void *
@@ -154,6 +171,9 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response)
 		           method ? method : "?", url ? url : "?");
 		if (method) {
 			*response = http_response_init("HTTP/1.1", 501, "Not Implemented");
+			/* http_response_finish only writes a length when there is a body, and an HTTP client
+			 * without one waits for the connection to close. */
+			http_response_add_header(*response, "Content-Length", "0");
 			http_response_finish(*response, NULL, 0);
 		}
 		return;
@@ -255,6 +275,9 @@ conn_destroy(void *ptr)
 {
 	raop_conn_t *conn = ptr;
 
+	if (g_active_conn == conn) {
+		g_active_conn = NULL;
+	}
 	if (conn->raop_rtp) {
 		/* This is done in case TEARDOWN was not called */
 		raop_rtp_destroy(conn->raop_rtp);

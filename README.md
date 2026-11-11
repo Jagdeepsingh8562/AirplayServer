@@ -56,6 +56,13 @@ Stick it also dropped frames, trailed the sound behind the picture and hung some
 - **Answers what it cannot do.** Requests without a `CSeq` header (AirPlay video casting) were dropped without a
   reply, so apps such as YouTube waited for ever. They now get `501 Not Implemented` and a log line, and the
   receiver no longer advertises video casting.
+- **Survives a bad disconnect.** A phone that dropped without saying goodbye could leave the receiver stuck on the
+  last picture, spinning at full CPU, or full of dead connections. The video reader now checks every read and
+  every length it is given, dead connections are noticed within about 15 seconds (TCP keepalive), a new session
+  replaces a stale one, and the decoder restarts itself after an error, a lost surface or falling behind. When a
+  session ends the TV goes back to a "Ready" screen instead of keeping the last frame. Closing the app releases
+  the decoder and the audio track so it can be opened again. `tools/connection_abuse.py` tests the connection
+  handling from a computer.
 - Asks only for the permissions it uses (`INTERNET`, `ACCESS_WIFI_STATE`), has a TV launcher entry, keeps the screen
   on, starts listening on its own and is called "AirPlay Receiver" / "Fire Stick" instead of "My Application" / "t1".
 
@@ -76,7 +83,9 @@ Open the app on the TV and leave it open: it starts listening by itself. On the 
 
 ## Limits
 
-- The picture is drawn into the app's window, so it shows **only while the app is open on the TV**.
+- The picture is drawn into the app's window, so it shows **only while the app is open on the TV**. If you leave
+  the app during a session and come back, the picture returns within a few seconds (it waits for the phone's next
+  keyframe).
 - **No AirPlay video casting.** The cast button inside apps such as YouTube does not work; use Screen Mirroring from
   Control Center and play the video on the phone.
 - **No password or PIN:** anyone on the same Wi-Fi can mirror to it.

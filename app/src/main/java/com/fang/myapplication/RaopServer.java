@@ -18,10 +18,13 @@ public class RaopServer implements SurfaceHolder.Callback {
         System.loadLibrary("play-lib");
     }
     private static final String TAG = "RaopServer";
-    private VideoPlayer mVideoPlayer;
-    private AudioPlayer mAudioPlayer;
-    private SurfaceView mSurfaceView;
+    private final VideoPlayer mVideoPlayer;
+    private final AudioPlayer mAudioPlayer;
+    private final SurfaceView mSurfaceView;
+    private volatile View mIdleView;
     private long mServerId = 0;
+    /** A mirroring session is on screen: set by its first frame, cleared when the native side says it ended. */
+    private volatile boolean mActive = false;
 
     /** Sizes the picture to the phone's own shape (centred, bars at the sides) instead of stretching it. */
     private final VideoPlayer.SizeListener mSizeListener = new VideoPlayer.SizeListener() {
@@ -48,15 +51,40 @@ public class RaopServer implements SurfaceHolder.Callback {
         mSurfaceView.getHolder().addCallback(this);
         mAudioPlayer = new AudioPlayer();
         mAudioPlayer.start();
+        // The players live as long as the server; the video one waits for a surface and for frames.
+        mVideoPlayer = new VideoPlayer(mSizeListener);
+        mVideoPlayer.start();
     }
 
+    /** The view shown while no session is on screen (it covers the last picture of the one that ended). */
+    public void setIdleView(View idleView) {
+        mIdleView = idleView;
+    }
+
+    private void showIdle(final boolean show) {
+        final View idle = mIdleView;
+        if (idle == null) return;
+        mSurfaceView.post(new Runnable() {
+            @Override
+            public void run() {
+                idle.setVisibility(show ? View.VISIBLE : View.GONE);
+            }
+        });
+    }
+
+    // Called from native threads.
     public void onRecvVideoData(byte[] nal, int nalType, long dts, long pts) {
+        if (!mActive) {
+            mActive = true;
+            Log.i(TAG, "mirroring started");
+            mVideoPlayer.newSession();
+            showIdle(false);
+        }
         NALPacket nalPacket = new NALPacket();
         nalPacket.nalData = nal;
         nalPacket.nalType = nalType;
         nalPacket.pts = pts;
-        VideoPlayer player = mVideoPlayer;
-        if (player != null) player.addPacker(nalPacket);
+        mVideoPlayer.addPacker(nalPacket);
     }
 
     public void onRecvAudioData(short[] pcm, long pts) {
@@ -66,6 +94,15 @@ public class RaopServer implements SurfaceHolder.Callback {
         mAudioPlayer.addPacker(pcmPacket);
     }
 
+    /** The mirror stream is over, whatever the reason (the phone stopped it, the connection died, a new session replaced it). */
+    public void onVideoEnded() {
+        Log.i(TAG, "mirroring ended");
+        mActive = false;
+        mVideoPlayer.endSession();
+        mAudioPlayer.flush();
+        showIdle(true);
+    }
+
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
 
@@ -73,15 +110,13 @@ public class RaopServer implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        if (mVideoPlayer == null) {
-            mVideoPlayer = new VideoPlayer(holder.getSurface(), mSizeListener);
-            mVideoPlayer.start();
-        }
+        mVideoPlayer.setSurface(holder.getSurface());
     }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-
+        // The app went to the background: the video player drops its decoder and picks up again on the next surface.
+        mVideoPlayer.setSurface(null);
     }
 
     public void startServer() {
@@ -96,6 +131,13 @@ public class RaopServer implements SurfaceHolder.Callback {
         }
         mServerId = 0;
 
+    }
+
+    /** Stops the server and the two player threads, which hold the decoder and the audio track: call it when the app closes. */
+    public void release() {
+        stopServer();
+        mVideoPlayer.end();
+        mAudioPlayer.stopPlay();
     }
 
     public int getPort() {

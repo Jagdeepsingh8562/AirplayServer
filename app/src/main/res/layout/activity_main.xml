@@ -9,6 +9,15 @@
         android:id="@+id/surface"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
+    <TextView
+        android:id="@+id/idle"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:gravity="center"
+        android:text="Ready&#10;Choose Fire Stick in Screen Mirroring on your iPhone, iPad or Mac"
+        android:textColor="#ffffff"
+        android:textSize="28sp" />
     <Button
         android:id="@+id/btn_control"
         android:layout_width="wrap_content"

@@ -71,6 +71,20 @@ public class AudioPlayer extends Thread {
         }
     }
 
+    /** Throw away what is queued and what is buffered in the track: the stream they belonged to is over. */
+    public void flush() {
+        mQueue.clear();
+        AudioTrack track = mTrack;
+        if (track == null) return;
+        try {
+            track.pause();
+            track.flush();
+            track.play();
+        } catch (IllegalStateException e) {
+            Log.w(TAG, "audio flush", e);
+        }
+    }
+
     public void stopPlay() {
         isStopThread = true;
         interrupt();

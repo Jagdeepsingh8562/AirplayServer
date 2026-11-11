@@ -284,15 +284,25 @@ raop_handler_setup(raop_conn_t *conn,
         char* eiv= NULL;
         uint64_t eiv_len = 0;
         plist_get_data_val(eiv_note, &eiv, &eiv_len);
+        if (!eiv || eiv_len < 16) {
+            logger_log(conn->raop->logger, LOGGER_ERR, "SETUP without a usable eiv: closing the connection");
+            http_response_set_disconnect(response, 1);
+            return;
+        }
         memcpy(aesiv, eiv, 16);
         logger_log(conn->raop->logger, LOGGER_DEBUG, "eiv_len = %llu", eiv_len);
         plist_t ekey_note = plist_dict_get_item(root_node, "ekey");
         char* ekey= NULL;
         uint64_t ekey_len = 0;
         plist_get_data_val(ekey_note, &ekey, &ekey_len);
+        if (!ekey || ekey_len < 72) {
+            logger_log(conn->raop->logger, LOGGER_ERR, "SETUP without a usable ekey: closing the connection");
+            http_response_set_disconnect(response, 1);
+            return;
+        }
         logger_log(conn->raop->logger, LOGGER_DEBUG, "ekey_len = %llu", ekey_len);
         // 时间port
-		uint64_t timing_rport;
+		uint64_t timing_rport = 0;
         plist_t time_note = plist_dict_get_item(root_node, "timingPort");
         plist_get_uint_val(time_note, &timing_rport);
 		logger_log(conn->raop->logger, LOGGER_DEBUG, "timing_rport = %llu", timing_rport);
@@ -301,6 +311,13 @@ raop_handler_setup(raop_conn_t *conn,
         logger_log(conn->raop->logger, LOGGER_DEBUG, "fairplay_decrypt ret = %d", ret);
 		unsigned char ecdh_secret[32];
         pairing_get_ecdh_secret_key(conn->pairing, ecdh_secret);
+        /* a new mirroring session replaces whatever was still open, here or on a connection that died */
+        if (g_active_conn && g_active_conn != conn) {
+            logger_log(conn->raop->logger, LOGGER_INFO, "A new session replaces the one still open");
+            conn_stop_streams(g_active_conn);
+        }
+        conn_stop_streams(conn);
+        g_active_conn = conn;
         memcpy(conn->aeskey, aeskey, 16);
         memcpy(conn->aesiv, aesiv, 16);
         memcpy(conn->ecdh_secret, ecdh_secret, 32);

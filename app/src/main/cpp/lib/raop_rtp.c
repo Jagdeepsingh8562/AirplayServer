@@ -17,6 +17,11 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#ifndef WIN32
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
 
 #include "raop_rtp.h"
 #include "raop.h"
@@ -215,6 +220,19 @@ raop_rtp_resend_callback(void *opaque, unsigned short seqnum, unsigned short cou
     }
 
     return 0;
+}
+
+/* The timing thread asks the phone for the time every 3 s and waits for the answer. Without a timeout it waits for
+ * ever once the phone stops answering, the thread never ends, and stopping the session (which joins it) hangs. */
+static void
+raop_rtp_set_recv_timeout(int fd)
+{
+#ifndef WIN32
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+#endif
 }
 
 static int
@@ -463,7 +481,10 @@ raop_rtp_thread_udp(void *arg)
             /* Timeout happened */
             continue;
         } else if (ret == -1) {
-            /* FIXME: Error happened */
+            if (errno == EINTR) {
+                continue; /* a signal interrupted the wait: not an error */
+            }
+            logger_log(raop_rtp->logger, LOGGER_INFO, "Error in select (audio): %s", strerror(errno));
             break;
         }
 

@@ -16,12 +16,20 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <errno.h>
+#ifndef WIN32
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
 
 #include "httpd.h"
 #include "netutils.h"
 #include "http_request.h"
 #include "compat.h"
 #include "logger.h"
+
+static void httpd_set_keepalive(int fd);
 
 struct http_connection_s {
 	int connected;
@@ -155,6 +163,7 @@ httpd_accept_connection(httpd_t *httpd, int server_fd, int is_ipv6)
 
 	logger_log(httpd->logger, LOGGER_INFO, "Accepted %s client on socket %d",
 	           (is_ipv6 ? "IPv6"  : "IPv4"), fd);
+	httpd_set_keepalive(fd);
 	local = netutils_get_address(&local_saddr, &local_len);
 	remote = netutils_get_address(&remote_saddr, &remote_len);
 
@@ -165,6 +174,20 @@ httpd_accept_connection(httpd_t *httpd, int server_fd, int is_ipv6)
 		return 0;
 	}
 	return 1;
+}
+
+/* A phone that vanishes (Wi-Fi off, app killed, device asleep) never closes its connection. Ask the kernel to
+ * probe an idle one: after about 5 + 3 x 3 seconds of silence the next read fails and the connection is freed. */
+static void
+httpd_set_keepalive(int fd)
+{
+#ifndef WIN32
+	int on = 1, idle = 5, interval = 3, count = 3;
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&on, sizeof(on));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, (const char *)&idle, sizeof(idle));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, (const char *)&interval, sizeof(interval));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, (const char *)&count, sizeof(count));
+#endif
 }
 
 static void
@@ -240,8 +263,11 @@ httpd_thread(void *arg)
 			/* Timeout happened */
 			continue;
 		} else if (ret == -1) {
-			/* FIXME: Error happened */
-			logger_log(httpd->logger, LOGGER_INFO, "Error in select");
+			if (errno == EINTR) {
+				/* a signal interrupted the wait: not an error. Ending here would stop the whole server. */
+				continue;
+			}
+			logger_log(httpd->logger, LOGGER_INFO, "Error in select: %s", strerror(errno));
 			break;
 		}
 
@@ -281,6 +307,16 @@ httpd_thread(void *arg)
 
 			logger_log(httpd->logger, LOGGER_DEBUG, "Receiving on socket %d", connection->socket_fd);
 			ret = recv(connection->socket_fd, buffer, sizeof(buffer), 0);
+			if (ret < 0) {
+				if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+					continue;
+				}
+				/* A reset or a keepalive timeout: the phone is gone. This used to be parsed as -1 bytes of request. */
+				logger_log(httpd->logger, LOGGER_INFO, "Connection error on socket %d: %s",
+				           connection->socket_fd, strerror(errno));
+				httpd_remove_connection(httpd, connection);
+				continue;
+			}
 			if (ret == 0) {
 				logger_log(httpd->logger, LOGGER_INFO, "Connection closed for socket %d", connection->socket_fd);
 				httpd_remove_connection(httpd, connection);

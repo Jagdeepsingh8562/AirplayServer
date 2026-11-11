@@ -100,9 +100,13 @@ in `logcat`):
 9. **JNI threads.** Native threads call into Java for every frame and packet. ART logs "Native thread exiting
    without having called DetachCurrentThread" at the end of a stream; the pthread-key destructor does detach, so
    it is harmless. Looking the methods up and attaching per call made the video choppy.
-10. **The picture needs the activity in front.** When the surface goes away (Home pressed) `RaopServer` tells the
-    video player, which drops its decoder; it starts a new one on the next surface and waits for a keyframe
-    (number 17). The session itself keeps running on the phone, so the picture returns within a few seconds.
+10. **The picture needs the activity in front, and leaving it costs the session.** The decoder is tied to the
+    `SurfaceView`'s surface, which is destroyed when the app goes to the background, and API 22 cannot swap a
+    decoder's output surface (`setOutputSurface` is API 23). The decoder must start again, which needs a keyframe
+    (number 17), which a Mac never sends. So after Home and back the app waits 3 s, asks for a new session, and the
+    sender starts one: a Mac reconnects by itself (about 10 to 30 s), an iPhone needs Screen Mirroring chosen again.
+    The real fix is to decode into a surface that is never destroyed (a `SurfaceTexture` rendered into the view
+    with GL), which is an open item.
 11. **mDNS can vanish.** After the stick has been idle for a long time the registration can silently drop (the
     phone no longer lists it). Close and reopen the app. Check with `dns-sd -B _airplay._tcp local.`
 12. **Log level.** The native logger is set to INFO (`raop_set_log_level` in `jni_raop_server.cpp`) and logs one line
@@ -132,21 +136,40 @@ in `logcat`):
     another phone (or the same one after a crash) sets up while an older connection is still open, the older one's
     streams are stopped first (`conn_stop_streams`) so two streams never feed the one decoder. A `SETUP` without a
     usable `eiv` or `ekey` closes the connection instead of reading a null pointer.
-17. **Session lifecycle in Java.** The mirror thread calls `video_end` when it exits, however it ends
-    (`jni_raop_server.cpp` to `RaopServer.onVideoEnded`). `VideoPlayer` takes session start and end as markers in
-    its frame queue, so they are handled in order with the frames. It releases the decoder at both, restarts it
-    when the surface changes or a call throws (a failed `MediaCodec` throws on everything after), starts a decoder
-    mid-stream with the saved SPS/PPS, and then drops frames until a keyframe (scan for NAL type 5; after 3 s it
-    decodes whatever arrives, so it cannot wait for ever). When more than 45 frames are queued (about 1.5 s) it
-    drops to the next keyframe instead of growing without limit. `MainActivity.onDestroy` calls
-    `RaopServer.release()`, because the player threads hold the hardware decoder and the audio track and a second
-    launch could not get them. Any Java exception left pending on a native thread aborts the next JNI call, so
-    `jni_raop_server.cpp` clears it after each callback.
+17. **Session lifecycle in Java, and keyframes.** The mirror thread calls `video_end` when it exits, however it
+    ends (`jni_raop_server.cpp` to `RaopServer.onVideoEnded`). `MainActivity` then shows the "Ready" screen; when a
+    session starts it hides the button and label so the picture has the whole screen (the theme has no action bar)
+    and brings the app to the front if another app was showing. `VideoPlayer` takes session start and end as
+    markers in its frame queue, so they are handled in order with the frames. **A decoder can only start at a
+    keyframe, and a Mac sends exactly one per session** (measured: one in 100 s; `VideoPlayer` logs each as
+    `keyframe: ... KB`). So a frame must never be dropped (nothing after it decodes correctly again) and a lost
+    decoder (an error, the surface gone) cannot start again mid-stream. Therefore: no frame is dropped for being
+    late (a queue of 900 frames gives the session up); `feed()` waits up to a second for a just-started decoder to
+    take input instead of skipping the frame; while there is no surface the latest keyframe and what follows are
+    kept (up to 24 MB), which only helps when the session started in the background; after a decoder is lost it
+    waits 3 s for a keyframe and then asks for a new session (`RaopServer.onNeedNewSession` to `raop_end_session`;
+    the HTTP thread, which owns the connection, stops the streams at its next request, at most about 2 s later);
+    the sender then starts a new session with a new keyframe. The decoder is restarted on an exception (a failed
+    `MediaCodec` throws on everything after). `MainActivity.onDestroy` calls `RaopServer.release()`, because the
+    player threads hold the hardware decoder and the audio track and a second launch could not get them. Any Java
+    exception left pending on a native thread aborts the next JNI call, so `jni_raop_server.cpp` clears it after
+    each callback. An early version dropped frames to the next keyframe when the decoder fell behind; with a Mac
+    that corrupts the picture for good, so do not bring it back.
 18. **Testing a bad disconnect without a phone.** `tools/connection_abuse.py <host> <port>` opens silent
     connections, sends half requests and garbage, resets them (RST), opens more than the 10 allowed, and checks the
     receiver still answers. It cannot reach the mirror reader (that needs a completed pairing); that part needs a
     phone: stop mirroring, switch the phone's Wi-Fi off mid-stream, press Home on the TV and come back, and watch
     for `mirroring ended` and the "Ready" screen.
+19. **The timing threads must never wait for ever.** `raop_rtp_thread_time` (audio) and
+    `raop_rtp_mirror_thread_time` (video) sent a timing request every 3 s and waited in `recvfrom()` with no
+    timeout. When the sender stopped answering (a Mac ending mirroring), the call never returned, the thread never
+    ended, and the `pthread_join` that stops a session hung, either on the HTTP thread (a `TEARDOWN` or closed
+    connection) or on the UI thread (the Stop button). Android then reported the app as not responding (seen
+    2026-11-11: main thread in `pthread_join` from `httpd_stop`, `raop_destroy`, `RaopServer.stop`,
+    `MainActivity.onClick`). Both timing sockets now have a 1 s receive timeout and the loops look at `running` again
+    when no answer comes. `RaopServer.stopServer()` also runs the native stop on its own thread, so the UI can
+    never be blocked by it. After an ANR, `adb pull /data/anr/traces.txt` (world-readable on this stick) holds every
+    thread's stack; the main thread's shows what it waited on.
 
 ## Building and testing
 
@@ -174,7 +197,8 @@ sound for a minute, pause and resume it, turn the phone sideways. Nothing here c
    works from any app. The surface handling in number 10 comes with it.
 3. An optional PIN. Today anyone on the Wi-Fi can mirror.
 4. Presentation timestamps for real lip-sync (number 8).
-5. Hide the action bar (a fullscreen theme) so the picture gets the whole screen; today it loses about 100 px.
+5. Decode into a surface that is never destroyed (a `SurfaceTexture` rendered into the view with GL), so leaving the
+   app and coming back keeps the session instead of restarting it (number 10).
 6. `AudioPlayer` dropped 293 packets in one long session with its 6-packet cap. A smoother resync (raise the cap a
    little, or drop only when it has stayed over for a moment) might remove the occasional click.
 7. AirPlay video casting (HLS): large. It needs the `/reverse` event channel (an HTTP upgrade), `/play`, `/rate`,

@@ -71,6 +71,7 @@ typedef struct raop_conn_s raop_conn_t;
 /* Only one mirroring session is shown. The connection that last set one up owns it; when a phone connects again
  * while an older connection is still open (it died without closing), the older one's streams are stopped. */
 static raop_conn_t *g_active_conn = NULL;
+static volatile int g_end_requested = 0;
 
 static void
 conn_stop_streams(raop_conn_t *conn)
@@ -154,6 +155,11 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response)
 {
 	raop_conn_t *conn = ptr;
     logger_log(conn->raop->logger, LOGGER_DEBUG, "conn_request");
+	if (g_end_requested && conn == g_active_conn) {
+		g_end_requested = 0;
+		logger_log(conn->raop->logger, LOGGER_INFO, "Ending the session: the player cannot recover its picture");
+		conn_stop_streams(conn);
+	}
 	const char *method;
 	const char *url;
 	const char *cseq;
@@ -348,6 +354,13 @@ raop_init(int max_clients, raop_callbacks_t *callbacks)
 	raop->pairing = pairing;
 	raop->httpd = httpd;
 	return raop;
+}
+
+void
+raop_end_session(raop_t *raop)
+{
+	(void) raop;
+	g_end_requested = 1;
 }
 
 void

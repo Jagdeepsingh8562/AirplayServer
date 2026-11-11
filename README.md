@@ -61,8 +61,15 @@ Stick it also dropped frames, trailed the sound behind the picture and hung some
   every length it is given, dead connections are noticed within about 15 seconds (TCP keepalive), a new session
   replaces a stale one, and the decoder restarts itself after an error, a lost surface or falling behind. When a
   session ends the TV goes back to a "Ready" screen instead of keeping the last frame. Closing the app releases
-  the decoder and the audio track so it can be opened again. `tools/connection_abuse.py` tests the connection
-  handling from a computer.
+  the decoder and the audio track so it can be opened again. A phone that stopped answering the timing requests
+  used to freeze the whole app when its session was stopped (Android reported it as not responding); those waits
+  now time out. `tools/connection_abuse.py` tests the connection handling from a computer.
+- **Full screen.** No title bar; while mirroring the button and name disappear and the picture gets the whole screen
+  (a portrait phone keeps its shape, with bars at the sides). When a phone starts mirroring while another app is
+  showing, the receiver comes to the front.
+- **Never skips a frame.** Some senders (a Mac) send one keyframe per session, so a skipped frame would leave the
+  picture broken for good. The decoder is given time to start, nothing is dropped for being late, and when a
+  picture cannot be recovered the receiver asks for a new session.
 - Asks only for the permissions it uses (`INTERNET`, `ACCESS_WIFI_STATE`), has a TV launcher entry, keeps the screen
   on, starts listening on its own and is called "AirPlay Receiver" / "Fire Stick" instead of "My Application" / "t1".
 
@@ -84,8 +91,9 @@ Open the app on the TV and leave it open: it starts listening by itself. On the 
 ## Limits
 
 - The picture is drawn into the app's window, so it shows **only while the app is open on the TV**. If you leave
-  the app during a session and come back, the picture returns within a few seconds (it waits for the phone's next
-  keyframe).
+  the app during a session and come back, the session restarts: a Mac reconnects by itself (about 10 to 30
+  seconds); an iPhone needs Screen Mirroring chosen again. The cause is that a Mac sends only one keyframe per
+  session and Android 5 cannot move a running video decoder to a new surface.
 - **No AirPlay video casting.** The cast button inside apps such as YouTube does not work; use Screen Mirroring from
   Control Center and play the video on the phone.
 - **No password or PIN:** anyone on the same Wi-Fi can mirror to it.

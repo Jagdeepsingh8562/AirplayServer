@@ -251,6 +251,8 @@ raop_rtp_init_sockets(raop_rtp_t *raop_rtp, int use_ipv6, int use_udp)
         goto sockets_cleanup;
     }
 
+    raop_rtp_set_recv_timeout(tsock);
+
     /* Set socket descriptors */
     raop_rtp->csock = csock;
     raop_rtp->tsock = tsock;
@@ -409,8 +411,15 @@ raop_rtp_thread_time(void *arg)
         logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp_thread_time sendlen = %d", sendlen);
 
         saddrlen = sizeof(saddr);
-        packetlen = recvfrom(raop_rtp->tsock, (char *)packet, sizeof(packet), 0,
-                             (struct sockaddr *)&saddr, &saddrlen);
+        int received = recvfrom(raop_rtp->tsock, (char *)packet, sizeof(packet), 0,
+                                (struct sockaddr *)&saddr, &saddrlen);
+        if (received < 32) {
+            /* No answer within the receive timeout (the sender is gone or slow), or an error. Look at `running`
+             * again instead of waiting for ever: this thread not ending made stopping the session hang the app. */
+            usleep(200000);
+            continue;
+        }
+        packetlen = received;
         int type_t = packet[1] & ~0x80;
         logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp_thread_time receive time type_t 0x%02x, packetlen = %d", type_t, packetlen);
         if (type_t == 0x53) {

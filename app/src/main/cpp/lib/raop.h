@@ -53,6 +53,9 @@ RAOP_API void raop_set_log_callback(raop_t *raop, raop_log_callback_t callback, 
 RAOP_API void raop_set_port(raop_t *raop, unsigned short port);
 RAOP_API unsigned short raop_get_port(raop_t *raop);
 RAOP_API void *raop_get_callback_cls(raop_t *raop);
+/* Ask for the current mirroring session to be ended (the player cannot recover its picture): the sender then starts a
+ * new one. Safe from any thread; the HTTP thread, which owns the connection, acts on it at its next request. */
+RAOP_API void raop_end_session(raop_t *raop);
 RAOP_API int raop_start(raop_t *raop, unsigned short *port);
 RAOP_API int raop_is_running(raop_t *raop);
 RAOP_API void raop_stop(raop_t *raop);

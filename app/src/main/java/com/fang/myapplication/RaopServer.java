@@ -13,6 +13,11 @@ import com.fang.myapplication.player.VideoPlayer;
 
 public class RaopServer implements SurfaceHolder.Callback {
 
+    /** Told when a mirroring session starts (true) and ends (false); called from a native thread. */
+    public interface Listener {
+        void onMirroringChanged(boolean active);
+    }
+
     static {
         System.loadLibrary("raop_server");
         System.loadLibrary("play-lib");
@@ -21,13 +26,23 @@ public class RaopServer implements SurfaceHolder.Callback {
     private final VideoPlayer mVideoPlayer;
     private final AudioPlayer mAudioPlayer;
     private final SurfaceView mSurfaceView;
-    private volatile View mIdleView;
+    private volatile Listener mListener;
     private long mServerId = 0;
     /** A mirroring session is on screen: set by its first frame, cleared when the native side says it ended. */
     private volatile boolean mActive = false;
 
     /** Sizes the picture to the phone's own shape (centred, bars at the sides) instead of stretching it. */
-    private final VideoPlayer.SizeListener mSizeListener = new VideoPlayer.SizeListener() {
+    private final VideoPlayer.Callbacks mSizeListener = new VideoPlayer.Callbacks() {
+        @Override
+        public void onNeedNewSession() {
+            // The picture cannot be recovered (a Mac sends one keyframe per session): end the session, and the
+            // sender starts a new one. A Mac does so by itself; an iPhone needs Screen Mirroring chosen again.
+            long id = mServerId;
+            if (id != 0) {
+                endSession(id);
+            }
+        }
+
         @Override
         public void onVideoSize(final int width, final int height) {
             mSurfaceView.post(new Runnable() {
@@ -56,20 +71,15 @@ public class RaopServer implements SurfaceHolder.Callback {
         mVideoPlayer.start();
     }
 
-    /** The view shown while no session is on screen (it covers the last picture of the one that ended). */
-    public void setIdleView(View idleView) {
-        mIdleView = idleView;
+    public void setListener(Listener listener) {
+        mListener = listener;
     }
 
-    private void showIdle(final boolean show) {
-        final View idle = mIdleView;
-        if (idle == null) return;
-        mSurfaceView.post(new Runnable() {
-            @Override
-            public void run() {
-                idle.setVisibility(show ? View.VISIBLE : View.GONE);
-            }
-        });
+    private void notifyMirroring(boolean active) {
+        Listener listener = mListener;
+        if (listener != null) {
+            listener.onMirroringChanged(active);
+        }
     }
 
     // Called from native threads.
@@ -78,7 +88,7 @@ public class RaopServer implements SurfaceHolder.Callback {
             mActive = true;
             Log.i(TAG, "mirroring started");
             mVideoPlayer.newSession();
-            showIdle(false);
+            notifyMirroring(true);
         }
         NALPacket nalPacket = new NALPacket();
         nalPacket.nalData = nal;
@@ -100,7 +110,7 @@ public class RaopServer implements SurfaceHolder.Callback {
         mActive = false;
         mVideoPlayer.endSession();
         mAudioPlayer.flush();
-        showIdle(true);
+        notifyMirroring(false);
     }
 
     @Override
@@ -126,11 +136,18 @@ public class RaopServer implements SurfaceHolder.Callback {
     }
 
     public void stopServer() {
-        if (mServerId != 0) {
-            stop(mServerId);
-        }
+        final long id = mServerId;
         mServerId = 0;
-
+        if (id != 0) {
+            // Stopping joins the native threads, which can take a moment; the UI thread must never wait for that
+            // (a thread that did not end froze the whole app, and Android reported it as not responding).
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    stop(id);
+                }
+            }, "raop-stop").start();
+        }
     }
 
     /** Stops the server and the two player threads, which hold the decoder and the audio track: call it when the app closes. */
@@ -150,4 +167,5 @@ public class RaopServer implements SurfaceHolder.Callback {
     private native long start();
     private native void stop(long serverId);
     private native int getPort(long serverId);
+    private native void endSession(long serverId);
 }

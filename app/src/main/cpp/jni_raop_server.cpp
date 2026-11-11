@@ -163,6 +163,11 @@ Java_com_fang_myapplication_RaopServer_getPort(JNIEnv* env, jobject object, jlon
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_fang_myapplication_RaopServer_endSession(JNIEnv* env, jobject object, jlong opaque) {
+    raop_end_session((raop_t *) (void *) opaque);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_fang_myapplication_RaopServer_stop(JNIEnv* env, jobject object, jlong opaque) {
     raop_t *raop = (raop_t *) (void *) opaque;
     jobject obj = (jobject) raop_get_callback_cls(raop);

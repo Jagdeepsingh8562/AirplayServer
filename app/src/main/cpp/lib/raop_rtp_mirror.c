@@ -14,6 +14,7 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <unistd.h>
 #endif
 
 #include "raop.h"
@@ -173,8 +174,15 @@ raop_rtp_mirror_thread_time(void *arg)
         logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror_thread_time sendlen = %d", sendlen);
 
         saddrlen = sizeof(saddr);
-        packetlen = recvfrom(raop_rtp_mirror->mirror_time_sock, (char *)packet, sizeof(packet), 0,
-                             (struct sockaddr *)&saddr, &saddrlen);
+        int received = recvfrom(raop_rtp_mirror->mirror_time_sock, (char *)packet, sizeof(packet), 0,
+                                (struct sockaddr *)&saddr, &saddrlen);
+        if (received < 48) {
+            /* No answer within the receive timeout (the phone is gone or slow), or an error. Look at `running`
+             * again instead of waiting for ever. */
+            usleep(200000);
+            continue;
+        }
+        packetlen = received;
         logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror_thread_time receive time packetlen = %d", packetlen);
         // 16-24 系统时钟最后一次被设定或更新的时间。
         uint64_t Reference_Timestamp = byteutils_read_timeStamp(packet, 16);
@@ -259,6 +267,20 @@ mirror_discard(raop_rtp_mirror_t *mirror, int fd, int len)
         len -= n;
     }
     return 0;
+}
+
+/* The timing thread asks the phone for the time every 3 s and waits for the answer. Without a timeout it waits for
+ * ever once the phone stops answering, the thread never ends, and stopping the session (which joins it) hangs the
+ * whole app: this is what froze the receiver when a Mac ended mirroring. */
+static void
+mirror_set_recv_timeout(int fd)
+{
+#ifndef WIN32
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+#endif
 }
 
 /* Probe an idle connection (a phone that vanished) and never block for ever on a half-sent frame. */
@@ -603,6 +625,8 @@ raop_rtp_init_mirror_sockets(raop_rtp_mirror_t *raop_rtp_mirror, int use_ipv6)
     if (listen(dsock, 1) < 0)
         goto sockets_cleanup;
 
+
+    mirror_set_recv_timeout(tsock);
 
     /* Set socket descriptors */
     raop_rtp_mirror->mirror_data_sock = dsock;

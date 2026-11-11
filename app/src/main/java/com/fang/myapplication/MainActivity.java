@@ -2,6 +2,7 @@ package com.fang.myapplication;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.SurfaceView;
@@ -21,6 +22,8 @@ public class MainActivity extends Activity implements View.OnClickListener {
     private Button mBtnControl;
     private TextView mTxtDevice;
     private boolean mIsStart = false;
+    private View mIdleView;
+    private volatile boolean mResumed = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -32,7 +35,18 @@ public class MainActivity extends Activity implements View.OnClickListener {
         mBtnControl.setOnClickListener(this);
         mSurfaceView = findViewById(R.id.surface);
         mRaopServer = new RaopServer(mSurfaceView);
-        mRaopServer.setIdleView(findViewById(R.id.idle));
+        mIdleView = findViewById(R.id.idle);
+        mRaopServer.setListener(new RaopServer.Listener() {
+            @Override
+            public void onMirroringChanged(final boolean active) {
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        showMirroring(active);
+                    }
+                });
+            }
+        });
         mDNSNotify = new DNSNotify();
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         // Start listening at once: on a TV nobody wants to find the Start button first.
@@ -42,6 +56,36 @@ public class MainActivity extends Activity implements View.OnClickListener {
                 if (!mIsStart) onClick(mBtnControl);
             }
         });
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        mResumed = true;
+    }
+
+    @Override
+    protected void onPause() {
+        mResumed = false;
+        super.onPause();
+    }
+
+    /**
+     * Mirroring: the picture alone, full screen, and this app in front. Not mirroring: the "Ready" screen with its
+     * button and the name.
+     */
+    private void showMirroring(boolean active) {
+        int chrome = active ? View.GONE : View.VISIBLE;
+        mIdleView.setVisibility(chrome);
+        mBtnControl.setVisibility(chrome);
+        mTxtDevice.setVisibility(chrome);
+        if (!active) {
+            mBtnControl.requestFocus();
+        } else if (!mResumed) {
+            // The phone started mirroring while another app was in front: bring this one up to show it.
+            startActivity(new Intent(this, MainActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
+        }
     }
 
     @Override

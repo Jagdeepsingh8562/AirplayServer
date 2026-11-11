@@ -10,39 +10,48 @@
 #include "lib/logger.h"
 #include <malloc.h>
 #include <cstring>
+#include <pthread.h>
 
 static JavaVM* g_JavaVM;
+static jmethodID g_audioMethod = NULL;
+static jmethodID g_videoMethod = NULL;
+static pthread_key_t g_detachKey;
+
+static void detach_thread(void *) {
+    g_JavaVM->DetachCurrentThread();
+}
+
+/* The decoder threads call in for every frame: attach each one once, and detach when it ends. */
+static JNIEnv* env_for_this_thread() {
+    JNIEnv* env = NULL;
+    if (g_JavaVM->GetEnv((void **) &env, JNI_VERSION_1_6) == JNI_OK) return env;
+    if (g_JavaVM->AttachCurrentThread(&env, NULL) != JNI_OK) return NULL;
+    pthread_setspecific(g_detachKey, env);
+    return env;
+}
 
 void OnRecvAudioData(void *observer, pcm_data_struct *data) {
     jobject obj = (jobject) observer;
-    JNIEnv* jniEnv = NULL;
-    g_JavaVM->AttachCurrentThread(&jniEnv, NULL);
-    jclass cls = jniEnv->GetObjectClass(obj);
-    jmethodID onRecvVideoDataM = jniEnv->GetMethodID(cls, "onRecvAudioData", "([SJ)V");
-    jniEnv->DeleteLocalRef(cls);
+    JNIEnv* jniEnv = env_for_this_thread();
+    if (jniEnv == NULL || g_audioMethod == NULL) return;
     jshortArray sarr = jniEnv->NewShortArray(data->data_len);
     if (sarr == NULL) return;
     jniEnv->SetShortArrayRegion(sarr, (jint) 0, data->data_len, (jshort *) data->data);
-    jniEnv->CallVoidMethod(obj, onRecvVideoDataM, sarr, data->pts);
+    jniEnv->CallVoidMethod(obj, g_audioMethod, sarr, data->pts);
     jniEnv->DeleteLocalRef(sarr);
-    g_JavaVM->DetachCurrentThread();
 }
 
 
 void OnRecvVideoData(void *observer, h264_decode_struct *data) {
     jobject obj = (jobject) observer;
-    JNIEnv* jniEnv = NULL;
-    g_JavaVM->AttachCurrentThread(&jniEnv, NULL);
-    jclass cls = jniEnv->GetObjectClass(obj);
-    jmethodID onRecvVideoDataM = jniEnv->GetMethodID(cls, "onRecvVideoData", "([BIJJ)V");
-    jniEnv->DeleteLocalRef(cls);
+    JNIEnv* jniEnv = env_for_this_thread();
+    if (jniEnv == NULL || g_videoMethod == NULL) return;
     jbyteArray barr = jniEnv->NewByteArray(data->data_len);
     if (barr == NULL) return;
     jniEnv->SetByteArrayRegion(barr, (jint) 0, data->data_len, (jbyte *) data->data);
-    jniEnv->CallVoidMethod(obj, onRecvVideoDataM, barr, data->frame_type,
+    jniEnv->CallVoidMethod(obj, g_videoMethod, barr, data->frame_type,
                                          data->pts, data->pts);
     jniEnv->DeleteLocalRef(barr);
-    g_JavaVM->DetachCurrentThread();
 }
 
 extern "C" void
@@ -90,6 +99,7 @@ log_callback(void *cls, int level, const char *msg) {
 extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* reserved) {
     g_JavaVM = vm;
+    pthread_key_create(&g_detachKey, detach_thread);
     return JNI_VERSION_1_6;
 }
 
@@ -98,7 +108,11 @@ Java_com_fang_myapplication_RaopServer_start(JNIEnv* env, jobject object) {
     raop_t *raop;
     raop_callbacks_t raop_cbs;
     memset(&raop_cbs, 0, sizeof(raop_cbs));
-    raop_cbs.cls = (void *) env->NewGlobalRef(object);;
+    jclass cls = env->GetObjectClass(object);
+    g_audioMethod = env->GetMethodID(cls, "onRecvAudioData", "([SJ)V");
+    g_videoMethod = env->GetMethodID(cls, "onRecvVideoData", "([BIJJ)V");
+    env->DeleteLocalRef(cls);
+    raop_cbs.cls = (void *) env->NewGlobalRef(object);
     raop_cbs.audio_process = audio_process;
     raop_cbs.audio_set_volume = audio_set_volume;
     raop_cbs.video_process = video_process;
@@ -111,7 +125,7 @@ Java_com_fang_myapplication_RaopServer_start(JNIEnv* env, jobject object) {
     }
 
     raop_set_log_callback(raop, log_callback, NULL);
-    raop_set_log_level(raop, RAOP_LOG_DEBUG);
+    raop_set_log_level(raop, RAOP_LOG_INFO);
 
     unsigned short port = 0;
     raop_start(raop, &port);

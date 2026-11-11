@@ -1,47 +1,31 @@
-apply plugin: 'com.android.application'
+plugins { id 'com.android.application' }
 
 android {
-    compileSdkVersion 27
+    namespace 'com.fang.myapplication'
+    compileSdk 34
+    ndkVersion '27.0.12077973'
     defaultConfig {
         applicationId "com.fang.myapplication"
-        minSdkVersion 22
-        targetSdkVersion 27
+        minSdk 22
+        // 22: the stick has no runtime permissions, so everything declared is granted at install
+        targetSdk 22
         versionCode 1
         versionName "1.0"
-        testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
-            cmake {
-                abiFilters "armeabi-v7a"
-                cppFlags ""
-            }
+            cmake { abiFilters "armeabi-v7a"; cppFlags ""; cFlags "-include string.h -include stdlib.h" }
         }
-        ndk {
-            abiFilters "armeabi-v7a"
-        }
-    }
-    buildTypes {
-        release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
-        }
+        ndk { abiFilters "armeabi-v7a" }
     }
     externalNativeBuild {
-        cmake {
-            path "CMakeLists.txt"
+        cmake { path "CMakeLists.txt"; version "3.22.1" }
+    }
+    // the 2019 sources and targetSdk 22 trip release lint (ExpiredTargetSdkVersion); this is a sideloaded build
+    lint { checkReleaseBuilds false }
+    buildTypes {
+        release {
+            // optimised native code (the debug build runs unoptimised, far too slow for video);
+            // debug-signed so it installs on the stick without a release key
+            signingConfig signingConfigs.debug
         }
     }
-    sourceSets {
-        main {
-            jni.srcDirs = []
-            jniLibs.srcDirs = ['libs']
-        }
-    }
-
-}
-
-dependencies {
-    implementation fileTree(dir: 'libs', include: ['*.jar'])
-    testImplementation 'junit:junit:4.12'
-    androidTestImplementation 'com.android.support.test:runner:1.0.2'
-    androidTestImplementation 'com.android.support.test.espresso:espresso-core:3.0.2'
 }

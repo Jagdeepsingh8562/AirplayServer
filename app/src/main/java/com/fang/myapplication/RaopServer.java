@@ -3,6 +3,8 @@ package com.fang.myapplication;
 import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.View;
+import android.widget.RelativeLayout;
 
 import com.fang.myapplication.model.NALPacket;
 import com.fang.myapplication.model.PCMPacket;
@@ -21,6 +23,26 @@ public class RaopServer implements SurfaceHolder.Callback {
     private SurfaceView mSurfaceView;
     private long mServerId = 0;
 
+    /** Sizes the picture to the phone's own shape (centred, bars at the sides) instead of stretching it. */
+    private final VideoPlayer.SizeListener mSizeListener = new VideoPlayer.SizeListener() {
+        @Override
+        public void onVideoSize(final int width, final int height) {
+            mSurfaceView.post(new Runnable() {
+                @Override
+                public void run() {
+                    View parent = (View) mSurfaceView.getParent();
+                    int pw = parent.getWidth(), ph = parent.getHeight();
+                    if (pw <= 0 || ph <= 0) return;
+                    float scale = Math.min((float) pw / width, (float) ph / height);
+                    RelativeLayout.LayoutParams lp = new RelativeLayout.LayoutParams(
+                            Math.round(width * scale), Math.round(height * scale));
+                    lp.addRule(RelativeLayout.CENTER_IN_PARENT);
+                    mSurfaceView.setLayoutParams(lp);
+                }
+            });
+        }
+    };
+
     public RaopServer(SurfaceView surfaceView) {
         mSurfaceView = surfaceView;
         mSurfaceView.getHolder().addCallback(this);
@@ -29,16 +51,15 @@ public class RaopServer implements SurfaceHolder.Callback {
     }
 
     public void onRecvVideoData(byte[] nal, int nalType, long dts, long pts) {
-        Log.d(TAG, "onRecvVideoData pts = " + pts + ", nalType = " + nalType + ", nal length = " + nal.length);
         NALPacket nalPacket = new NALPacket();
         nalPacket.nalData = nal;
         nalPacket.nalType = nalType;
         nalPacket.pts = pts;
-        mVideoPlayer.addPacker(nalPacket);
+        VideoPlayer player = mVideoPlayer;
+        if (player != null) player.addPacker(nalPacket);
     }
 
     public void onRecvAudioData(short[] pcm, long pts) {
-        Log.d(TAG, "onRecvAudioData pcm length = " + pcm.length + ", pts = " + pts);
         PCMPacket pcmPacket = new PCMPacket();
         pcmPacket.data = pcm;
         pcmPacket.pts = pts;
@@ -53,7 +74,7 @@ public class RaopServer implements SurfaceHolder.Callback {
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         if (mVideoPlayer == null) {
-            mVideoPlayer = new VideoPlayer(holder.getSurface());
+            mVideoPlayer = new VideoPlayer(holder.getSurface(), mSizeListener);
             mVideoPlayer.start();
         }
     }

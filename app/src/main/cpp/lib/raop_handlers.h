@@ -53,7 +53,7 @@ raop_handler_info(raop_conn_t *conn,
 			,0x65,0x54,0xe7,0x5a,0x6d,0x61,0x63,0x41,0x64,0x64,0x72,0x65,0x73,0x73,0x10,0x02
 			,0xa1,0x2c,0x10,0x04,0xa2,0x13,0x19,0x5c,0x61,0x75,0x64,0x69,0x6f,0x46,0x6f,0x72
 			,0x6d,0x61,0x74,0x73,0x54,0x6e,0x61,0x6d,0x65,0x08,0x52,0x76,0x76,0x13,0x00,0x00
-			,0x00,0x1e,0x5a,0x7f,0xff,0xf7,0x5f,0x10,0x12,0x69,0x6e,0x70,0x75,0x74,0x4c,0x61
+			,0x00,0x1e,0x5a,0x7f,0xff,0xe6,0x5f,0x10,0x12,0x69,0x6e,0x70,0x75,0x74,0x4c,0x61
 			,0x74,0x65,0x6e,0x63,0x79,0x4d,0x69,0x63,0x72,0x6f,0x73,0x5b,0x73,0x74,0x61,0x74
 			,0x75,0x73,0x46,0x6c,0x61,0x67,0x73,0x57,0x41,0x70,0x70,0x6c,0x65,0x54,0x56,0xd4
 			,0x1e,0x20,0x22,0x16,0x1f,0x21,0x21,0x17,0x57,0x64,0x65,0x66,0x61,0x75,0x6c,0x74
@@ -225,7 +225,6 @@ raop_handler_options(raop_conn_t *conn,
 	http_response_add_header(response, "Public", "SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
 }
 
-static int setup = 0;
 
 static void
 raop_handler_setup(raop_conn_t *conn,
@@ -270,10 +269,15 @@ raop_handler_setup(raop_conn_t *conn,
     plist_t root_node = NULL;
     plist_from_bin(data, datalen, &root_node);
     plist_t streams_note = plist_dict_get_item(root_node, "streams");
-    if (setup == 0) {
+    uint64_t stream_type = 0;
+    if (streams_note) {
+        plist_t first_stream = plist_array_get_item(streams_note, 0);
+        plist_t first_type = first_stream ? plist_dict_get_item(first_stream, "type") : NULL;
+        if (first_type) plist_get_uint_val(first_type, &stream_type);
+    }
+    if (plist_dict_get_item(root_node, "ekey") != NULL) {
 		unsigned char aesiv[16];
 		unsigned char aeskey[16];
-        setup++;
         logger_log(conn->raop->logger, LOGGER_DEBUG, "SETUP 1");
         // 第一次setup
         plist_t eiv_note = plist_dict_get_item(root_node, "eiv");
@@ -297,11 +301,15 @@ raop_handler_setup(raop_conn_t *conn,
         logger_log(conn->raop->logger, LOGGER_DEBUG, "fairplay_decrypt ret = %d", ret);
 		unsigned char ecdh_secret[32];
         pairing_get_ecdh_secret_key(conn->pairing, ecdh_secret);
+        memcpy(conn->aeskey, aeskey, 16);
+        memcpy(conn->aesiv, aesiv, 16);
+        memcpy(conn->ecdh_secret, ecdh_secret, 32);
+        conn->timing_rport = timing_rport;
+        conn->have_keys = 1;
         conn->raop_rtp = raop_rtp_init(conn->raop->logger, &conn->raop->callbacks, conn->remote, conn->remotelen, aeskey, aesiv, ecdh_secret, timing_rport);
 		conn->raop_rtp_mirror = raop_rtp_mirror_init(conn->raop->logger, &conn->raop->callbacks, conn->remote, conn->remotelen, aeskey, ecdh_secret, timing_rport);
-    } else if (setup == 1) {
+    } else if (stream_type == 110) {
 		unsigned short tport=0, dport=0;
-        setup++;
         logger_log(conn->raop->logger, LOGGER_DEBUG, "SETUP 2");
 		plist_t stream_note = plist_array_get_item(streams_note, 0);
 		plist_t type_note = plist_dict_get_item(stream_note, "type");
@@ -348,6 +356,11 @@ raop_handler_setup(raop_conn_t *conn,
         logger_log(conn->raop->logger, LOGGER_DEBUG, "SETUP 3");
         unsigned short cport = 0, tport = 0, dport = 0;
 
+        if (!conn->raop_rtp && conn->have_keys) {
+            /* the audio was torn down and the phone sets it up again */
+            conn->raop_rtp = raop_rtp_init(conn->raop->logger, &conn->raop->callbacks, conn->remote, conn->remotelen,
+                                           conn->aeskey, conn->aesiv, conn->ecdh_secret, conn->timing_rport);
+        }
         if (conn->raop_rtp) {
             raop_rtp_start_audio(conn->raop_rtp, use_udp, remote_cport, remote_tport, &cport, &tport, &dport);
             logger_log(conn->raop->logger, LOGGER_DEBUG, "RAOP initialized success");

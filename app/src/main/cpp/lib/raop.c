@@ -52,6 +52,13 @@ struct raop_conn_s {
 	fairplay_t *fairplay;
 	pairing_session_t *pairing;
 
+	/* Kept from the first SETUP (mirror info): a stream torn down and set up again needs them. */
+	int have_keys;
+	unsigned char aeskey[16];
+	unsigned char aesiv[16];
+	unsigned char ecdh_secret[32];
+	unsigned long long timing_rport;
+
 	unsigned char *local;
 	int locallen;
 
@@ -141,6 +148,14 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response)
 	url = http_request_get_url(request);
 	cseq = http_request_get_header(request, "CSeq");
 	if (!method || !cseq) {
+		/* AirPlay video casting (/play, /reverse, ...) arrives as plain HTTP without CSeq. It used to be
+		 * dropped without any answer, so the phone waited for ever: say it is not supported. */
+		logger_log(conn->raop->logger, LOGGER_INFO, "Unsupported request without CSeq: %s %s",
+		           method ? method : "?", url ? url : "?");
+		if (method) {
+			*response = http_response_init("HTTP/1.1", 501, "Not Implemented");
+			http_response_finish(*response, NULL, 0);
+		}
 		return;
 	}
 
@@ -150,7 +165,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response)
 	//http_response_add_header(*response, "Apple-Jack-Status", "connected; type=analog");
 	http_response_add_header(*response, "Server", "AirTunes/220.68");
 
-	logger_log(conn->raop->logger, LOGGER_DEBUG, "Handling request %s with URL %s", method, url);
+	logger_log(conn->raop->logger, LOGGER_INFO, "Handling request %s with URL %s", method, url);
 	raop_handler_t handler = NULL;
 	if (!strcmp(method, "GET") && !strcmp(url, "/info")) {
 		handler = &raop_handler_info;
@@ -189,17 +204,40 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response)
 			logger_log(conn->raop->logger, LOGGER_WARNING, "RAOP not initialized at FLUSH");
 		}
 	} else if (!strcmp(method, "TEARDOWN")) {
-		http_response_add_header(*response, "Connection", "close");
-		if (conn->raop_rtp) {
-			/* Destroy our RTP session */
-			raop_rtp_destroy(conn->raop_rtp);
-			conn->raop_rtp = NULL;
+		/* The phone names the stream it ends: 96 is the audio, 110 the screen. The old code ended
+		 * everything on any TEARDOWN, so pausing the sound also killed the picture. */
+		unsigned long long stream_type = 0;
+		int td_len = 0;
+		const char *td_data = http_request_get_data(request, &td_len);
+		if (td_data && td_len > 0) {
+			plist_t td_root = NULL;
+			plist_from_bin(td_data, td_len, &td_root);
+			plist_t td_streams = td_root ? plist_dict_get_item(td_root, "streams") : NULL;
+			plist_t td_stream = td_streams ? plist_array_get_item(td_streams, 0) : NULL;
+			plist_t td_type = td_stream ? plist_dict_get_item(td_stream, "type") : NULL;
+			if (td_type) {
+				uint64_t type_value = 0;
+				plist_get_uint_val(td_type, &type_value);
+				stream_type = type_value;
+			}
+			if (td_root) plist_free(td_root);
 		}
-        if (conn->raop_rtp_mirror) {
-            /* Destroy our mirror session */
-            raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
-            conn->raop_rtp_mirror = NULL;
-        }
+		logger_log(conn->raop->logger, LOGGER_INFO, "TEARDOWN of stream type %llu", stream_type);
+		if (stream_type != 96) {
+			if (conn->raop_rtp_mirror) {
+				raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
+				conn->raop_rtp_mirror = NULL;
+			}
+		}
+		if (stream_type != 110) {
+			if (conn->raop_rtp) {
+				raop_rtp_destroy(conn->raop_rtp);
+				conn->raop_rtp = NULL;
+			}
+		}
+		if (stream_type == 0) {
+			http_response_add_header(*response, "Connection", "close");
+		}
 	}
 	if (handler != NULL) {
 		handler(conn, request, *response, &response_data, &response_datalen);

@@ -22,11 +22,11 @@ public class DNSNotify {
 
     public DNSNotify() {
         mMacAddress = NetUtils.getLocalMacAddress();
-        mDeviceName = "t";
+        mDeviceName = "Fire Stick";
     }
 
     public void changeDeviceName() {
-        mDeviceName = "t" + mDeviceTail++;
+        // The name stays "Fire Stick": the old "t1", "t2" count is gone.
     }
 
     public String getDeviceName() {
@@ -37,7 +37,7 @@ public class DNSNotify {
         Log.d(TAG, "registerAirplay port = " + port + ", mMacAddress = " + mMacAddress);
         TXTRecord txtRecord = new TXTRecord();
         txtRecord.set("deviceid", mMacAddress);
-        txtRecord.set("features", "0x5A7FFFF7,0x1E");
+        txtRecord.set("features", "0x5A7FFFE6,0x1E");
         txtRecord.set("srcvers", "220.68");
         txtRecord.set("flags", "0x4");
         txtRecord.set("vv", "2");
@@ -57,7 +57,7 @@ public class DNSNotify {
         txtRecord.set("da", "true");
         txtRecord.set("et", "0,3,5");
         txtRecord.set("vv", "2");
-        txtRecord.set("ft", "0x5A7FFFF7,0x1E");
+        txtRecord.set("ft", "0x5A7FFFE6,0x1E");
         txtRecord.set("am", "AppleTV2,1");
         txtRecord.set("md", "0,1,2");
         txtRecord.set("rhd", "5.6.0.0");
